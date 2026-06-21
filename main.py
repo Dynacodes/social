@@ -27,9 +27,6 @@ app.add_middleware(
 # Default User-Agent (mimics a real browser)
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-# Path to cookies file
-COOKIES_FILE = "cookies.txt"
-
 def sanitize_filename(filename):
     """Remove emojis and non-ASCII characters from filename."""
     if not filename:
@@ -41,10 +38,8 @@ def sanitize_filename(filename):
 
 @app.get("/")
 async def root():
-    cookies_status = "✅ Present" if os.path.exists(COOKIES_FILE) else "❌ Missing"
     return {
         "message": "Video Downloader API is running",
-        "cookies": cookies_status,
         "endpoints": {
             "/ping": "Health check",
             "/download?url=VIDEO_URL": "Download video (YouTube, TikTok, Vimeo, etc.)"
@@ -59,103 +54,63 @@ async def ping():
 async def download_video(url: str = Query(..., description="Full URL of the video")):
     """
     Download video from YouTube, TikTok, Vimeo, Dailymotion, etc.
-    Uses aggressive format fallback strategy.
+    Returns the video file as an attachment.
     """
     temp_dir = tempfile.mkdtemp()
     try:
-        cookies_file_path = COOKIES_FILE if os.path.exists(COOKIES_FILE) else None
+        logger.info(f"Downloading: {url}")
 
-        # Step 1: Get video info WITHOUT any format restrictions
-        logger.info(f"Fetching info for: {url}")
+        # Step 1: Try to get video info
         info = None
         try:
-            # Use minimal options for info fetch - NO format specified
             with yt_dlp.YoutubeDL({
                 'quiet': True,
                 'no_warnings': True,
                 'user_agent': DEFAULT_USER_AGENT,
-                'cookiefile': cookies_file_path,
-                'extract_flat': False,
                 'ignoreerrors': True,
             }) as ydl:
                 info = ydl.extract_info(url, download=False)
-                logger.info(f"✅ Video title: {info.get('title', 'Unknown')}")
-                
-                # Log available formats for debugging
-                formats = info.get('formats', [])
-                logger.info(f"📊 Available formats: {len(formats)}")
-                if formats:
-                    # Log first few formats
-                    for i, fmt in enumerate(formats[:5]):
-                        logger.info(f"   Format {i+1}: {fmt.get('format_note', 'N/A')} - {fmt.get('ext', 'N/A')}")
-                
+                logger.info(f"Video title: {info.get('title', 'Unknown') if info else 'Unknown'}")
         except Exception as e:
-            logger.error(f"Failed to get info: {e}")
-            raise Exception(f"Could not fetch video info: {str(e)[:200]}")
+            logger.warning(f"Info fetch failed: {e}")
 
-        if not info:
-            raise Exception("Could not fetch video information")
-
-        title = info.get('title', 'video')
+        # Step 2: Get title (fallback to 'video' if no info)
+        title = 'video'
+        if info and isinstance(info, dict):
+            title = info.get('title', 'video')
+        
         safe_title = sanitize_filename(title)
         unique_id = str(uuid.uuid4())[:8]
         base_filename = f"{safe_title}_{unique_id}"
 
-        # Step 2: Use formats directly from info
-        formats = info.get('formats', [])
-        if not formats:
-            raise Exception("No formats found for this video")
-
-        # Step 3: Try to find a working format by scanning available formats
+        # Step 3: Try direct download with best format
         downloaded_file = None
         last_error = None
 
-        # Strategy: Try formats in order of preference
-        format_preferences = [
-            # 1. MP4 with audio (most compatible)
-            {'ext': 'mp4', 'vcodec': 'avc1', 'acodec': 'mp4a'},
-            # 2. Any MP4
-            {'ext': 'mp4'},
-            # 3. WebM
-            {'ext': 'webm'},
-            # 4. 3GP (mobile)
-            {'ext': '3gp'},
-            # 5. Any format
-            {},
+        # Try different format strategies
+        format_strategies = [
+            'bestvideo+bestaudio/best',  # Best quality
+            'best[ext=mp4]',              # Best MP4
+            'best',                       # Best format
+            'worst',                      # Worst quality (last resort)
         ]
 
-        for preference in format_preferences:
+        for fmt in format_strategies:
             try:
-                # Find matching format from available formats
-                matching_formats = []
-                for fmt in formats:
-                    match = True
-                    for key, value in preference.items():
-                        if fmt.get(key) != value:
-                            match = False
-                            break
-                    if match:
-                        matching_formats.append(fmt)
+                logger.info(f"Trying format: {fmt}")
                 
-                if not matching_formats:
-                    # If no match, use the first available format
-                    matching_formats = [formats[0]]
-
-                # Take the best quality from matching formats
-                selected_format = max(matching_formats, key=lambda f: f.get('height', 0) or 0)
-                format_id = selected_format.get('format_id')
-                ext = selected_format.get('ext', 'mp4')
-                
-                logger.info(f"🎯 Selected format: {format_id} ({ext})")
-                
-                filename = f"{base_filename}.{ext}"
+                # Clear temp directory
+                for f in os.listdir(temp_dir):
+                    try:
+                        os.remove(os.path.join(temp_dir, f))
+                    except:
+                        pass
 
                 ydl_opts = {
-                    'outtmpl': os.path.join(temp_dir, filename),
+                    'outtmpl': os.path.join(temp_dir, f"{base_filename}.%(ext)s"),
                     'quiet': True,
                     'no_warnings': True,
-                    'extract_flat': False,
-                    'format': format_id,  # Use specific format ID
+                    'format': fmt,
                     'ignoreerrors': True,
                     'user_agent': DEFAULT_USER_AGENT,
                     'headers': {
@@ -167,7 +122,6 @@ async def download_video(url: str = Query(..., description="Full URL of the vide
                         'Connection': 'keep-alive',
                         'Upgrade-Insecure-Requests': '1',
                     },
-                    'cookiefile': cookies_file_path,
                     'allow_unplayable_formats': True,
                 }
 
@@ -176,56 +130,28 @@ async def download_video(url: str = Query(..., description="Full URL of the vide
 
                 # Find the downloaded file
                 for f in os.listdir(temp_dir):
-                    if f.endswith(('.mp4', '.mkv', '.webm', '.mp3', '.m4a', '.flv', '.avi', '.3gp')):
+                    if f.endswith(('.mp4', '.mkv', '.webm', '.mp3', '.m4a', '.flv', '.avi')):
                         downloaded_file = os.path.join(temp_dir, f)
                         break
 
                 if downloaded_file and os.path.exists(downloaded_file):
-                    logger.info(f"✅ Successfully downloaded: {os.path.basename(downloaded_file)}")
+                    logger.info(f"✅ Downloaded: {os.path.basename(downloaded_file)}")
                     break
-                else:
-                    logger.warning(f"⚠️ No file downloaded for format {format_id}")
 
             except Exception as e:
                 last_error = str(e)
-                logger.warning(f"❌ Format failed: {str(e)[:100]}")
+                logger.warning(f"Format '{fmt}' failed: {e}")
                 continue
 
-        # Step 4: If all failed, try direct approach with best format
         if not downloaded_file:
-            logger.info("Trying direct approach with 'best' format...")
-            try:
-                ydl_opts = {
-                    'outtmpl': os.path.join(temp_dir, f"{base_filename}.mp4"),
-                    'quiet': True,
-                    'no_warnings': True,
-                    'format': 'best',
-                    'ignoreerrors': True,
-                    'user_agent': DEFAULT_USER_AGENT,
-                    'cookiefile': cookies_file_path,
-                    'allow_unplayable_formats': True,
-                }
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.extract_info(url, download=True)
-                
-                for f in os.listdir(temp_dir):
-                    if f.endswith(('.mp4', '.mkv', '.webm', '.mp3', '.m4a', '.flv', '.avi', '.3gp')):
-                        downloaded_file = os.path.join(temp_dir, f)
-                        break
-            except Exception as e:
-                last_error = str(e)
-                logger.error(f"Direct approach failed: {e}")
-
-        if not downloaded_file:
-            error_msg = "Could not find a compatible video format. "
-            if last_error and ('drm' in last_error.lower() or 'DRM' in last_error):
-                error_msg += "This video appears to be DRM protected and cannot be downloaded."
+            error_msg = "Could not download video. "
+            if last_error:
+                error_msg += f"Last error: {last_error[:150]}"
             else:
-                error_msg += "The video may be DRM protected, age-restricted, or have restricted formats."
-                error_msg += f"\nLast error: {last_error[:200] if last_error else 'Unknown'}"
+                error_msg += "No compatible format found."
             raise Exception(error_msg)
 
-        # Step 5: Determine content type and return file
+        # Step 4: Return the file
         file_ext = os.path.splitext(downloaded_file)[1].lower()
         content_type_map = {
             '.mp4': "video/mp4",
@@ -234,8 +160,7 @@ async def download_video(url: str = Query(..., description="Full URL of the vide
             '.mp3': "audio/mpeg",
             '.m4a': "audio/mp4",
             '.flv': "video/x-flv",
-            '.avi': "video/x-msvideo",
-            '.3gp': "video/3gpp"
+            '.avi': "video/x-msvideo"
         }
         media_type = content_type_map.get(file_ext, "video/mp4")
 
@@ -252,19 +177,15 @@ async def download_video(url: str = Query(..., description="Full URL of the vide
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
         error_msg = str(e)
-
-        # Provide helpful error messages
+        
+        # Clean up error messages
         if "Sign in to confirm" in error_msg or "bot" in error_msg.lower():
-            error_msg = "YouTube is blocking automated access. The cookies file may be expired. Please refresh your cookies."
-        elif "UnicodeEncodeError" in error_msg or "latin-1" in error_msg:
-            error_msg = "Video contains special characters. Please try again."
+            error_msg = "YouTube is blocking automated access. Please try again later or use a different video."
         elif "Private video" in error_msg:
             error_msg = "This video is private and cannot be downloaded."
         elif "Video unavailable" in error_msg:
             error_msg = "This video is unavailable or has been removed."
-        elif "drm" in error_msg.lower() or "DRM" in error_msg:
-            error_msg = "This video is DRM protected and cannot be downloaded."
         elif "format" in error_msg.lower():
-            error_msg = "Could not find a compatible video format. The video may be DRM protected or age-restricted."
-
+            error_msg = "Could not find a compatible video format."
+        
         raise HTTPException(status_code=400, detail=error_msg)
