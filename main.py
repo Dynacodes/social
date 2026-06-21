@@ -4,50 +4,66 @@ import yt_dlp
 import os
 import tempfile
 import shutil
+import re
 
 app = FastAPI(title="Social Media Downloader", version="1.0")
 
+def sanitize_filename(filename):
+    """Remove emojis and non-ASCII characters from filename."""
+    # Remove emojis and other non-ASCII characters
+    filename = filename.encode('ascii', 'ignore').decode('ascii')
+    # Replace any remaining problematic characters
+    filename = re.sub(r'[^\w\-_. ]', '', filename)
+    return filename.strip()
+
 @app.get("/")
 async def root():
-    return {"message": "Send a GET request to /download?url=VIDEO_URL"}
+    return {"message": "Social Media Downloader API is running. Use /download?url=VIDEO_URL"}
 
 @app.get("/ping")
 async def ping():
-    """Simple health check for uptime monitoring."""
     return {"status": "alive"}
 
 @app.get("/download")
 async def download_video(url: str = Query(..., description="Full URL of the video")):
     """
-    Download a video/audio from any supported platform (TikTok, Instagram, Facebook, YouTube, etc.)
-    Returns the file as an attachment.
+    Download video from any supported platform.
+    Returns the video file as an attachment.
     """
-    # Create a temporary directory for this download
     temp_dir = tempfile.mkdtemp()
     try:
-        # yt-dlp options
+        # First, extract info without downloading to get the title
+        with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            title = info.get('title', 'video')
+            ext = info.get('ext', 'mp4')
+            # Sanitize the title to remove emojis
+            safe_title = sanitize_filename(title)
+            filename = f"{safe_title}.{ext}"
+
+        # Now download with the sanitized filename
         ydl_opts = {
-            'outtmpl': os.path.join(temp_dir, '%(title).50s_%(id)s.%(ext)s'),
+            'outtmpl': os.path.join(temp_dir, filename),
             'quiet': True,
             'no_warnings': True,
             'extract_flat': False,
-            'format': 'bestvideo+bestaudio/best',  # best quality
+            'format': 'bestvideo+bestaudio/best',
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            ydl.extract_info(url, download=True)
 
-        # Find the downloaded file
-        downloaded_file = None
-        for file in os.listdir(temp_dir):
-            if file.endswith(('.mp4', '.mkv', '.webm', '.mp3', '.m4a')):
-                downloaded_file = os.path.join(temp_dir, file)
-                break
+        downloaded_file = os.path.join(temp_dir, filename)
+        if not os.path.exists(downloaded_file):
+            # Fallback: find any file in temp_dir
+            for file in os.listdir(temp_dir):
+                if file.endswith(('.mp4', '.mkv', '.webm', '.mp3', '.m4a')):
+                    downloaded_file = os.path.join(temp_dir, file)
+                    break
 
-        if not downloaded_file:
+        if not os.path.exists(downloaded_file):
             raise Exception("No media file was downloaded")
 
-        # Return the file directly to the user
         return FileResponse(
             path=downloaded_file,
             media_type="video/mp4",
@@ -56,12 +72,5 @@ async def download_video(url: str = Query(..., description="Full URL of the vide
         )
 
     except Exception as e:
-        # Clean up the temporary folder on error
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail=str(e))
-
-    finally:
-        # Note: FastAPI's FileResponse will keep the file open until it's sent,
-        # then it will automatically delete it (because it's in a temporary directory).
-        # We can let FastAPI handle the cleanup.
-        pass
