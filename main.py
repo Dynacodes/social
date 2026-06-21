@@ -79,12 +79,24 @@ async def download_video(url: str = Query(..., description="Full URL of the vide
             if len(filename) > 200:
                 filename = f"{safe_title[:100]}_{unique_id}.{ext}"
 
-        # Try different format combinations in order
+        # Expanded format options - more comprehensive
         format_options = [
-            'bestvideo+bestaudio/best',  # Try to merge best video + audio
-            'best[ext=mp4]',              # Best MP4
-            'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',  # MP4 fallback
-            'best',                       # Best single format
+            # Best quality with fallbacks
+            'bestvideo+bestaudio/best',
+            # Best MP4 format
+            'best[ext=mp4]',
+            # Best video + best audio (any container)
+            'bestvideo+bestaudio',
+            # Best format that works
+            'best',
+            # MP4 specific combinations
+            'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            # WebM as fallback
+            'bestvideo[ext=webm]+bestaudio[ext=webm]/best[ext=webm]',
+            # Any working format
+            'bestaudio/best',
+            # Worst quality but guaranteed to work (last resort)
+            'worst',
         ]
 
         downloaded_file = None
@@ -92,6 +104,13 @@ async def download_video(url: str = Query(..., description="Full URL of the vide
 
         for fmt in format_options:
             try:
+                # Clear temp directory for each attempt (keep it clean)
+                for file in os.listdir(temp_dir):
+                    try:
+                        os.remove(os.path.join(temp_dir, file))
+                    except:
+                        pass
+
                 ydl_opts = {
                     'outtmpl': os.path.join(temp_dir, filename),
                     'quiet': True,
@@ -110,6 +129,9 @@ async def download_video(url: str = Query(..., description="Full URL of the vide
                         'Upgrade-Insecure-Requests': '1',
                     },
                     'cookiefile': cookies_file_path,
+                    # Add these to help with DRM and format issues
+                    'allow_unplayable_formats': True,
+                    'extract_flat': False,
                 }
 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -117,7 +139,7 @@ async def download_video(url: str = Query(..., description="Full URL of the vide
 
                 # Find the downloaded file
                 for file in os.listdir(temp_dir):
-                    if file.endswith(('.mp4', '.mkv', '.webm', '.mp3', '.m4a')):
+                    if file.endswith(('.mp4', '.mkv', '.webm', '.mp3', '.m4a', '.flv', '.avi')):
                         downloaded_file = os.path.join(temp_dir, file)
                         break
 
@@ -126,10 +148,42 @@ async def download_video(url: str = Query(..., description="Full URL of the vide
 
             except Exception as e:
                 last_error = str(e)
+                # Only log if it's not a common expected error
+                if 'Requested format is not available' not in str(e):
+                    print(f"Format '{fmt}' failed: {e}")
                 continue
 
         if not downloaded_file or not os.path.exists(downloaded_file):
-            raise Exception(last_error or "No media file was downloaded")
+            # If no file was downloaded, try one more time with a simpler approach
+            try:
+                ydl_opts = {
+                    'outtmpl': os.path.join(temp_dir, 'video.%(ext)s'),
+                    'quiet': True,
+                    'no_warnings': True,
+                    'format': 'best[ext=mp4]',
+                    'ignoreerrors': True,
+                    'user_agent': DEFAULT_USER_AGENT,
+                    'cookiefile': cookies_file_path,
+                    'allow_unplayable_formats': True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.extract_info(url, download=True)
+                
+                for file in os.listdir(temp_dir):
+                    if file.endswith(('.mp4', '.mkv', '.webm', '.mp3', '.m4a', '.flv', '.avi')):
+                        downloaded_file = os.path.join(temp_dir, file)
+                        break
+            except Exception as e:
+                last_error = str(e)
+
+        if not downloaded_file or not os.path.exists(downloaded_file):
+            # Check if the video might be DRM protected
+            error_msg = "Could not find a compatible video format. "
+            if last_error and 'drm' in last_error.lower():
+                error_msg += "This video appears to be DRM protected and cannot be downloaded."
+            else:
+                error_msg += "The video may be DRM protected or have restricted formats."
+            raise Exception(error_msg)
 
         # Determine content type
         file_ext = os.path.splitext(downloaded_file)[1].lower()
@@ -138,7 +192,9 @@ async def download_video(url: str = Query(..., description="Full URL of the vide
             '.mkv': "video/x-matroska",
             '.webm': "video/webm",
             '.mp3': "audio/mpeg",
-            '.m4a': "audio/mp4"
+            '.m4a': "audio/mp4",
+            '.flv': "video/x-flv",
+            '.avi': "video/x-msvideo"
         }
         media_type = content_type_map.get(file_ext, "video/mp4")
 
@@ -165,6 +221,8 @@ async def download_video(url: str = Query(..., description="Full URL of the vide
             error_msg = "This video is private and cannot be downloaded."
         elif "Video unavailable" in error_msg:
             error_msg = "This video is unavailable or has been removed."
+        elif "drm" in error_msg.lower() or "DRM" in error_msg:
+            error_msg = "This video is DRM protected and cannot be downloaded."
         elif "format" in error_msg.lower():
             error_msg = "Could not find a compatible video format. The video may be DRM protected."
 
