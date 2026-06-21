@@ -55,32 +55,6 @@ async def root():
 async def ping():
     return {"status": "alive"}
 
-def get_ydl_opts(temp_dir, filename, cookies_file_path, format_spec='best'):
-    """Generate yt-dlp options with common settings"""
-    return {
-        'outtmpl': os.path.join(temp_dir, filename),
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': False,
-        'format': format_spec,
-        'ignoreerrors': True,
-        'user_agent': DEFAULT_USER_AGENT,
-        'headers': {
-            'User-Agent': DEFAULT_USER_AGENT,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-        },
-        'cookiefile': cookies_file_path if cookies_file_path else None,
-        'allow_unplayable_formats': True,
-        'extract_flat': False,
-        'force_generic_extractor': False,
-        'quiet': True,
-    }
-
 @app.get("/download")
 async def download_video(url: str = Query(..., description="Full URL of the video")):
     """
@@ -91,19 +65,30 @@ async def download_video(url: str = Query(..., description="Full URL of the vide
     try:
         cookies_file_path = COOKIES_FILE if os.path.exists(COOKIES_FILE) else None
 
-        # Step 1: Get video info to see what formats are available
+        # Step 1: Get video info WITHOUT any format restrictions
         logger.info(f"Fetching info for: {url}")
         info = None
         try:
+            # Use minimal options for info fetch - NO format specified
             with yt_dlp.YoutubeDL({
                 'quiet': True,
                 'no_warnings': True,
                 'user_agent': DEFAULT_USER_AGENT,
                 'cookiefile': cookies_file_path,
+                'extract_flat': False,
+                'ignoreerrors': True,
             }) as ydl:
                 info = ydl.extract_info(url, download=False)
-                logger.info(f"Video title: {info.get('title', 'Unknown')}")
-                logger.info(f"Available formats: {len(info.get('formats', []))}")
+                logger.info(f"✅ Video title: {info.get('title', 'Unknown')}")
+                
+                # Log available formats for debugging
+                formats = info.get('formats', [])
+                logger.info(f"📊 Available formats: {len(formats)}")
+                if formats:
+                    # Log first few formats
+                    for i, fmt in enumerate(formats[:5]):
+                        logger.info(f"   Format {i+1}: {fmt.get('format_note', 'N/A')} - {fmt.get('ext', 'N/A')}")
+                
         except Exception as e:
             logger.error(f"Failed to get info: {e}")
             raise Exception(f"Could not fetch video info: {str(e)[:200]}")
@@ -115,58 +100,77 @@ async def download_video(url: str = Query(..., description="Full URL of the vide
         safe_title = sanitize_filename(title)
         unique_id = str(uuid.uuid4())[:8]
         base_filename = f"{safe_title}_{unique_id}"
-        ext = 'mp4'  # Default extension
 
-        # Step 2: Try multiple format strategies in order
-        format_strategies = [
-            # Strategy 1: Best video + best audio (default)
-            {'format': 'bestvideo+bestaudio/best', 'desc': 'Best video + audio'},
-            # Strategy 2: Best MP4
-            {'format': 'best[ext=mp4]', 'desc': 'Best MP4'},
-            # Strategy 3: Best video + best audio (any container)
-            {'format': 'bestvideo+bestaudio', 'desc': 'Best video + audio (any)'},
-            # Strategy 4: Best format
-            {'format': 'best', 'desc': 'Best format'},
-            # Strategy 5: WebM format
-            {'format': 'bestvideo[ext=webm]+bestaudio[ext=webm]/best[ext=webm]', 'desc': 'WebM'},
-            # Strategy 6: 3GP format (smallest)
-            {'format': 'best[ext=3gp]', 'desc': '3GP (small)'},
-            # Strategy 7: Worst quality (guaranteed to work)
-            {'format': 'worst', 'desc': 'Worst quality'},
-            # Strategy 8: Audio only (last resort)
-            {'format': 'bestaudio/best', 'desc': 'Audio only'},
-        ]
+        # Step 2: Use formats directly from info
+        formats = info.get('formats', [])
+        if not formats:
+            raise Exception("No formats found for this video")
 
+        # Step 3: Try to find a working format by scanning available formats
         downloaded_file = None
         last_error = None
 
-        for strategy in format_strategies:
+        # Strategy: Try formats in order of preference
+        format_preferences = [
+            # 1. MP4 with audio (most compatible)
+            {'ext': 'mp4', 'vcodec': 'avc1', 'acodec': 'mp4a'},
+            # 2. Any MP4
+            {'ext': 'mp4'},
+            # 3. WebM
+            {'ext': 'webm'},
+            # 4. 3GP (mobile)
+            {'ext': '3gp'},
+            # 5. Any format
+            {},
+        ]
+
+        for preference in format_preferences:
             try:
-                # Clear temp directory for each attempt
-                for f in os.listdir(temp_dir):
-                    try:
-                        os.remove(os.path.join(temp_dir, f))
-                    except:
-                        pass
-
-                format_spec = strategy['format']
-                desc = strategy['desc']
-                logger.info(f"Trying format: {desc} ({format_spec})")
-
-                # Generate filename with extension hint
-                if 'mp4' in format_spec or 'mp4' in desc.lower():
-                    filename = f"{base_filename}.mp4"
-                elif 'webm' in format_spec or 'webm' in desc.lower():
-                    filename = f"{base_filename}.webm"
-                elif '3gp' in format_spec or '3gp' in desc.lower():
-                    filename = f"{base_filename}.3gp"
-                elif 'audio' in desc.lower() or 'audio' in format_spec:
-                    filename = f"{base_filename}.mp3"
-                else:
-                    filename = f"{base_filename}.mp4"
-
-                ydl_opts = get_ydl_opts(temp_dir, filename, cookies_file_path, format_spec)
+                # Find matching format from available formats
+                matching_formats = []
+                for fmt in formats:
+                    match = True
+                    for key, value in preference.items():
+                        if fmt.get(key) != value:
+                            match = False
+                            break
+                    if match:
+                        matching_formats.append(fmt)
                 
+                if not matching_formats:
+                    # If no match, use the first available format
+                    matching_formats = [formats[0]]
+
+                # Take the best quality from matching formats
+                selected_format = max(matching_formats, key=lambda f: f.get('height', 0) or 0)
+                format_id = selected_format.get('format_id')
+                ext = selected_format.get('ext', 'mp4')
+                
+                logger.info(f"🎯 Selected format: {format_id} ({ext})")
+                
+                filename = f"{base_filename}.{ext}"
+
+                ydl_opts = {
+                    'outtmpl': os.path.join(temp_dir, filename),
+                    'quiet': True,
+                    'no_warnings': True,
+                    'extract_flat': False,
+                    'format': format_id,  # Use specific format ID
+                    'ignoreerrors': True,
+                    'user_agent': DEFAULT_USER_AGENT,
+                    'headers': {
+                        'User-Agent': DEFAULT_USER_AGENT,
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.5',
+                        'Accept-Encoding': 'gzip, deflate, br',
+                        'DNT': '1',
+                        'Connection': 'keep-alive',
+                        'Upgrade-Insecure-Requests': '1',
+                    },
+                    'cookiefile': cookies_file_path,
+                    'allow_unplayable_formats': True,
+                }
+
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.extract_info(url, download=True)
 
@@ -177,22 +181,22 @@ async def download_video(url: str = Query(..., description="Full URL of the vide
                         break
 
                 if downloaded_file and os.path.exists(downloaded_file):
-                    logger.info(f"✅ Success with format: {desc}")
+                    logger.info(f"✅ Successfully downloaded: {os.path.basename(downloaded_file)}")
                     break
                 else:
-                    logger.warning(f"⚠️ No file downloaded for format: {desc}")
+                    logger.warning(f"⚠️ No file downloaded for format {format_id}")
 
             except Exception as e:
                 last_error = str(e)
-                logger.warning(f"❌ Format '{desc}' failed: {str(e)[:100]}")
+                logger.warning(f"❌ Format failed: {str(e)[:100]}")
                 continue
 
-        # Step 3: If all strategies failed, try a direct approach
+        # Step 4: If all failed, try direct approach with best format
         if not downloaded_file:
-            logger.info("All strategies failed, trying direct approach...")
+            logger.info("Trying direct approach with 'best' format...")
             try:
                 ydl_opts = {
-                    'outtmpl': os.path.join(temp_dir, f"{base_filename}.%(ext)s"),
+                    'outtmpl': os.path.join(temp_dir, f"{base_filename}.mp4"),
                     'quiet': True,
                     'no_warnings': True,
                     'format': 'best',
@@ -200,8 +204,6 @@ async def download_video(url: str = Query(..., description="Full URL of the vide
                     'user_agent': DEFAULT_USER_AGENT,
                     'cookiefile': cookies_file_path,
                     'allow_unplayable_formats': True,
-                    'force_generic_extractor': False,
-                    'extract_flat': False,
                 }
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.extract_info(url, download=True)
@@ -214,7 +216,6 @@ async def download_video(url: str = Query(..., description="Full URL of the vide
                 last_error = str(e)
                 logger.error(f"Direct approach failed: {e}")
 
-        # Step 4: Check if video is DRM protected
         if not downloaded_file:
             error_msg = "Could not find a compatible video format. "
             if last_error and ('drm' in last_error.lower() or 'DRM' in last_error):
