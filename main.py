@@ -28,44 +28,6 @@ def sanitize_filename(filename):
     filename = ' '.join(filename.split())
     return filename.strip() or "media"
 
-def is_image_url(url):
-    """Check if the URL is likely an image post (Instagram, Facebook, etc.)"""
-    image_domains = [
-        'instagram.com/p/',
-        'instagram.com/reel/',
-        'fb.watch',
-        'facebook.com/photo',
-        'facebook.com/watch',
-        'twitter.com',
-        'x.com',
-        'pinterest.com',
-        'flickr.com',
-        'imgur.com',
-        'tumblr.com'
-    ]
-    url_lower = url.lower()
-    for domain in image_domains:
-        if domain in url_lower:
-            return True
-    return False
-
-def is_video_url(url):
-    """Check if the URL is likely a video"""
-    video_domains = [
-        'youtube.com',
-        'youtu.be',
-        'tiktok.com',
-        'vimeo.com',
-        'dailymotion.com',
-        'twitch.tv',
-        'reddit.com'
-    ]
-    url_lower = url.lower()
-    for domain in video_domains:
-        if domain in url_lower:
-            return True
-    return False
-
 @app.get("/")
 async def root():
     return {
@@ -73,7 +35,7 @@ async def root():
         "endpoints": {
             "/ping": "Health check",
             "/download?url=VIDEO_URL": "Download video (YouTube, TikTok, etc.)",
-            "/download/image?url=IMAGE_URL": "Download image (Instagram, Facebook, etc.)"
+            "/download/image?url=IMAGE_URL": "Download image/video (Instagram, Facebook, Twitter, Pinterest, etc.)"
         }
     }
 
@@ -83,7 +45,10 @@ async def ping():
 
 @app.get("/download")
 async def download_video(url: str = Query(..., description="Full URL of the video")):
-    """Download video from any supported platform."""
+    """
+    Download video from any supported platform.
+    Returns the video file as an attachment.
+    """
     temp_dir = tempfile.mkdtemp()
     try:
         # Get video info first
@@ -112,9 +77,10 @@ async def download_video(url: str = Query(..., description="Full URL of the vide
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.extract_info(url, download=True)
 
+        # Find the downloaded file
         downloaded_file = None
         for file in os.listdir(temp_dir):
-            if file.endswith(('.mp4', '.mkv', '.webm', '.mp3', '.m4a', '.mp4')):
+            if file.endswith(('.mp4', '.mkv', '.webm', '.mp3', '.m4a')):
                 downloaded_file = os.path.join(temp_dir, file)
                 break
 
@@ -146,53 +112,33 @@ async def download_image(url: str = Query(..., description="Full URL of the imag
     """
     temp_dir = tempfile.mkdtemp()
     try:
-        # First, get the info to determine what we're downloading
-        with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            
-            title = info.get('title', 'media')
-            ext = info.get('ext', 'jpg')
-            
-            # If it's a video from Instagram/Facebook, use mp4
-            if ext in ['mp4', 'webm', 'mkv']:
-                ext = 'mp4'
-                media_type = "video/mp4"
-            else:
-                # Default to image
-                ext = 'jpg'
-                media_type = "image/jpeg"
-            
-            safe_title = sanitize_filename(title)
-            unique_id = str(uuid.uuid4())[:8]
-            filename = f"{safe_title}_{unique_id}.{ext}"
-            
-            if len(filename) > 200:
-                filename = f"{safe_title[:100]}_{unique_id}.{ext}"
-
-        # Download with specific options
+        # Use yt-dlp with options that work for both images and videos
         ydl_opts = {
-            'outtmpl': os.path.join(temp_dir, filename),
+            'outtmpl': os.path.join(temp_dir, '%(title)s_%(id)s.%(ext)s'),
             'quiet': True,
             'no_warnings': True,
             'extract_flat': False,
-            'format': 'best',  # This gets best quality image or video
+            'format': 'best',  # Gets the best quality (image or video)
             'ignoreerrors': True,
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Download the media
             ydl.extract_info(url, download=True)
 
         # Find the downloaded file
         downloaded_file = None
         for file in os.listdir(temp_dir):
-            if file.endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.mp4', '.webm', '.mkv')):
+            # Handle both images and videos
+            if file.endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', 
+                            '.mp4', '.webm', '.mkv')):
                 downloaded_file = os.path.join(temp_dir, file)
                 break
 
         if not downloaded_file or not os.path.exists(downloaded_file):
             raise Exception("No media file was downloaded")
 
-        # Determine content type
+        # Determine content type based on file extension
         file_ext = os.path.splitext(downloaded_file)[1].lower()
         content_type_map = {
             '.jpg': "image/jpeg",
